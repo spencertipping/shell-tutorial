@@ -204,3 +204,198 @@ fork.c
 ls-shell
 ls-shell.c
 ```
+
+### `argv` support
+`argv` is specified during the `exec()` call, and those arguments are forwarded
+by the kernel as `char* argv[]` to the new program. The exact mechanism for
+this is specified by the operating system's ABI and handled by `libc` before it
+calls into `main()`.
+
+We could execute `ls -l` by specifying an argument after the program name. The
+program name is always the first entry in `argv` because otherwise a program
+wouldn't know where it existed in the filesystem. Most programs don't rely on
+you to set `argv[0]` accurately, though some things like
+[BusyBox](https://en.wikipedia.org/wiki/BusyBox) use it to figure out which
+program you intended to run (since they're all linked to the same file).
+
+While we're at it, let's go ahead and handle user input too.
+
+```c
+// argv-shell.c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main() {
+  char   *words[256];
+  char   *line      = NULL;
+  size_t  line_size = 0;
+  ssize_t n;
+  pid_t   child;
+  int     child_status;
+
+  while ((n = getline(&line, &line_size, stdin)) > 0) {
+    // Erase ending newline by shortening the string by one
+    line[n - 1] = '\0';
+
+    // Split the line into argv words on spaces
+    words[0] = line;
+    for (int i = 1; words[i] = strchr(words[i - 1], ' '); ++i)
+      *(words[i]++) = '\0';
+
+    if (child = fork()) {
+      // Parent process: wait for the child
+      waitpid(child, &child_status, 0);
+      fprintf(stderr, "child exited with status %d\n", child_status);
+      fflush(stderr);
+    } else {
+      // Child process: exec or complain
+      execv(words[0], words);
+      perror("execv() failed");
+      return 1;
+    }
+  }
+}
+```
+
+Now we have a functioning, if awful, shell:
+
+```sh
+$ c99 -o argv-shell argv-shell.c
+$ ./argv-shell
+/bin/ls
+README.md  argv-shell.c  fork-broken    fork.c    ls-shell.c
+a.out      fork          fork-broken.c  ls-shell
+child exited with status 0
+/bin/ls -l
+total 76
+-rw-r--r-- 1 spencertipping spencertipping 9313 Apr 23 16:10 README.md
+-rwxr-xr-x 1 spencertipping spencertipping 9120 Apr 23 16:11 a.out
+-rw-r--r-- 1 spencertipping spencertipping  964 Apr 23 16:11 argv-shell.c
+-rwxr-xr-x 1 spencertipping spencertipping 8800 Apr 22 11:09 fork
+-rwxr-xr-x 1 spencertipping spencertipping 8712 Apr 22 12:02 fork-broken
+-rw-r--r-- 1 spencertipping spencertipping  184 Apr 22 12:02 fork-broken.c
+-rw-r--r-- 1 spencertipping spencertipping  164 Apr 22 11:35 fork.c
+-rwxr-xr-x 1 spencertipping spencertipping 8816 Apr 23 09:21 ls-shell
+-rw-r--r-- 1 spencertipping spencertipping  324 Apr 23 09:21 ls-shell.c
+child exited with status 0
+```
+
+Awful things at this point include:
+
+1. The shell doesn't search through `$PATH` entries, which means we have to
+   type out the full path of the program we want to execute.
+2. Multiple spaces in a row will produce empty `argv` entries, due to the way
+   we're parsing stuff.
+3. It provides no support for redirection of any kind.
+
+(1) and (2) are beyond the scope of this tutorial -- but you can see the
+solution to (1) by running `strace` on `/bin/sh`:
+
+```sh
+$ strace /bin/sh -c ls 2>&1 | grep stat
+stat("/usr/local/sbin/ls", 0x7ffc8df82ce0) = -1 ENOENT (No such file or directory)
+stat("/usr/local/bin/ls", 0x7ffc8df82ce0) = -1 ENOENT (No such file or directory)
+stat("/usr/sbin/ls", 0x7ffc8df82ce0)    = -1 ENOENT (No such file or directory)
+stat("/usr/bin/ls", 0x7ffc8df82ce0)     = -1 ENOENT (No such file or directory)
+stat("/sbin/ls", 0x7ffc8df82ce0)        = -1 ENOENT (No such file or directory)
+stat("/bin/ls", {st_mode=S_IFREG|0755, st_size=126584, ...}) = 0
+```
+
+Basically, the shell is looking at each `$PATH` entry and calling `stat()` to
+see if those files exist and are executable. When it finds one that is, it
+backfills the path and calls `exec`.
+
+#### Why we wait for child processes
+The common answer is that "you'll accumulate zombies and this is bad," but how
+bad can it really be? By the time a program exits, it can't possibly use much
+memory. Why do we care?
+
+For short-lived code it really doesn't matter much. Once you exit, any child
+processes you've created will be adopted by `init`, which will wait for them to
+exit and nothing bad happens. The problem is what happens if you keep running.
+
+The PID returned by `fork` is a promise from the kernel that until you collect
+the child process, the PID will refer to that process. That is, the kernel
+isn't at liberty to reuse the PID until you've called `wait` or `waitpid` to
+free it. If the kernel did reuse PIDs without acknowledgement, you'd run into
+race conditions where you could send a signal "to your child process" -- but
+that process had exited and been replaced by something else.
+
+So zombie processes aren't a memory issue, they're a PID issue. Most systems
+don't have that many:
+
+```sh
+$ cat /proc/sys/kernel/max_pid
+32768
+```
+
+### Pipelines
+Right now we can run `/bin/ls` and `/usr/bin/wc -l`, but we can't pipe one into
+the other. To fix this we'll need to create a pipe and then hook the
+reading-end up to stdin on the second process, and the writing-end up to stdout
+of the first.
+
+Here's what this looks like:
+
+```c
+// simple-pipe.c
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+  int pipe_fds[2];              // (read_end, write_end)
+  pipe(pipe_fds);
+  char *ls_args[] = { "/bin/ls", NULL };
+  char *wc_args[] = { "/usr/bin/wc", "-l", NULL };
+  if (fork()) {
+    // /bin/ls: replace stdout (fd 1) with the write end of the pipe
+    dup2(pipe_fds[1], 1);       // alias pipe_fds[1] to fd 1
+    close(pipe_fds[1]);         // remove pipe_fds[1] from fd table
+    close(pipe_fds[0]);         // explained below
+    execv("/bin/ls", ls_args);
+  } else {
+    // /bin/wc: do the same thing for fd 0
+    dup2(pipe_fds[0], 0);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    execv("/usr/bin/wc", wc_args);
+  }
+}
+```
+
+```sh
+$ c99 -o simple-pipe simple-pipe.c
+$ ./simple-pipe
+11
+```
+
+#### Why we close file descriptors (and what this does)
+When I was first learning about this stuff I assumed `close()` must have some
+effect on the underlying IO device, but this isn't true. This will make sense
+if you look at it from the kernel's point of view.
+
+```
+  /bin/ls               /usr/bin/wc -l
+    fd 0 -----------+     fd 0 -----------+
+    fd 1 --------+  |     fd 1 --------+  |
+    fd 2 -----+  |  |     fd 2 -----+  |  |
+              |  |  |               |  |  |        userspace
+============================================================
+              |  |  |               |  |  |     kernel space
+              |  |  |               |  |  |
+              |  /  |               |  |  /
+              +-(---+---------------+--+-(-----  pty device (4 references)
+                 \                        \
+                 |                        |
+                 +------------------------+---- pipe device (2 references)
+```
+
+Closing a file descriptor will cause the kernel to remove an entry from a
+process's FD table, but the underlying device won't know the difference. The
+device is impacted only when no program refers to it; at that point the kernel
+will deallocate it. `dup2` is the same kind of thing: it creates a new FD table
+reference within a program, but otherwise doesn't change the IO picture.
