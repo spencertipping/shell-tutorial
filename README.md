@@ -27,14 +27,13 @@ graphical program that owns the shell process; internally, it's set up like
 this:
 
 ```
-   +---------------------------+              +----------------------------+
-   |                           |  pty device  |                            |
-   |  terminal emulator   fd N-+--------------+-fd 0 (stdin)               |
-   |  (e.g. xterm, iterm)      |              +-fd 1 (stdout)   /bin/bash  |
-   |                           |              +-fd 2 (stderr)              |
-   +---------------------------+              |                            |
                                               +----------------------------+
-
+   +---------------------------+              |                            |
+   |                           |  pty device  +-fd 0 (stdin)               |
+   |  terminal emulator   fd N-+--------------+-fd 1 (stdout)   /bin/bash  |
+   |  (e.g. xterm, iterm)      |              +-fd 2 (stderr)              |
+   |                           |              |                            |
+   +---------------------------+              +----------------------------+
 ```
 
 The PTY device behaves like a bidirectional data pipe (a socket): if you write
@@ -133,7 +132,75 @@ from the parent -- though subsequent modifications, just like memory, aren't
 shared. But this is why both `printf` calls went to the same terminal.
 
 ### `exec`, address spaces, and executables
-`exec` means "turn into another program," which brings up a more fundamental
-question: "what does it mean to 'be' a program?"
+[`exec`](https://en.wikipedia.org/wiki/Exec_(system_call)) means "turn into
+another program," which brings up a more fundamental question: "what does it
+mean to 'be' a program?"
 
+Let's start with the executable file format. Linux uses the [ELF
+format](https://en.wikipedia.org/wiki/Executable_and_Linkable_Format) for
+binaries -- other OSes use [files with similar
+concepts](https://en.wikipedia.org/wiki/COFF) but different
+implementation details. The basic pieces are (see `man elf`):
 
+```
+e_ident                 # magic number for ELF files
+e_machine...            # some bytes specifying the machine code architecture
+e_entry                 # entry point (start address) within virtual memory
+...
+program_headers...      # a list of program memory mappings
+  memory_address        # location within virtual memory
+  file_address          # offset within this file
+...
+```
+
+There are other fields used for things like debugging symbols, but the fields
+above are what governs the executable process itself. (For a more concrete
+example of how this works, check out
+[tinyelf](https://github.com/spencertipping/tinyelf), which reduces compiled C
+programs down to minimal ELF files.)
+
+So when you call `exec`, the kernel first resets the [virtual memory
+space](https://en.wikipedia.org/wiki/Virtual_memory) for the process, then goes
+through the program headers and sets up memory mappings into the executable
+file. Once that's done, it points the processor at `e_entry` to transfer
+control to the program.
+
+`exec` also does a few other things to manage state, like closing file
+descriptors marked with the `FD_CLOEXEC` flag and resetting signal handlers.
+I'll cover the relevant details as we get into the shell logic.
+
+## Ok, shell time
+With that background the basic structure of a shell should be a little clearer.
+We can start by writing a "shell" hard-coded to run `ls`:
+
+```c
+// ls-shell.c
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+  char *const ls_argv[] = { "/bin/ls", NULL };
+  if (!fork()) {
+    // we're the child: execute ls
+    execv("/bin/ls", ls_argv);
+    perror("uh oh, execv() returned\n");
+    return 1;
+  }
+
+  // we're the parent
+  printf("hope that worked\n");
+  return 0;
+}
+```
+
+```sh
+$ c99 -o ls-shell ls-shell.c
+$ ./ls-shell
+hope that worked
+README.md
+fork
+fork-broken
+fork-broken.c
+fork.c
+ls-shell
+ls-shell.c
+```
