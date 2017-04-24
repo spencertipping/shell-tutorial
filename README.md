@@ -399,3 +399,12 @@ process's FD table, but the underlying device won't know the difference. The
 device is impacted only when no program refers to it; at that point the kernel
 will deallocate it. `dup2` is the same kind of thing: it creates a new FD table
 reference within a program, but otherwise doesn't change the IO picture.
+
+# TODO
+- Pipelines in a shell (like more than one of them)
+- File redirection example
+- Network redirection example
+- Background jobs, process groups, and weird `SIGTTOU` stuff
+- Conditionals
+- How to parse this stuff without using `strchr`?
+- Suggestive commentary about how JIT for a shell would be the best thing ever
